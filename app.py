@@ -1,5 +1,6 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import ctypes
 import os
 import queue
 import sys
@@ -14,6 +15,12 @@ from tkinter import colorchooser, filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 import core
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except Exception:
+    DND_FILES = None
+    TkinterDnD = None
 
 APP_NAME = "批量水印工具"
 IMAGE_TYPES = [("图片", "*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff"), ("所有文件", "*.*")]
@@ -72,6 +79,10 @@ class WatermarkApp:
         self.disp_scale = 1.0
         self.disp_ox = 0
         self.disp_oy = 0
+        self.pan_x = 0
+        self.pan_y = 0
+        self.pan_anchor: tuple[int, int] | None = None
+        self.pan_origin = (0, 0)
         self.drag_start: tuple[int, int] | None = None
         self.temp_rect = None
         self.last_pt: tuple[int, int] | None = None
@@ -80,11 +91,13 @@ class WatermarkApp:
         self.worker: threading.Thread | None = None
         self.q: queue.Queue = queue.Queue()
         self.last_out = ""
+        self.out_base = ""
+        self.zoom = 1.0
 
         self.folder_var = tk.StringVar()
         self.count_var = tk.StringVar(value="未选择文件夹")
         self.sample_var = tk.StringVar(value="未加载样图")
-        self.status_var = tk.StringVar(value="就绪")
+        self.status_var = tk.StringVar(value="就绪 · 可把文件夹拖进窗口")
         self.recursive_var = tk.BooleanVar(value=False)
         self.tool_var = tk.StringVar(value="rect")
         self.brush_var = tk.IntVar(value=28)
@@ -101,6 +114,8 @@ class WatermarkApp:
 
         self._build()
         self.root.after(100, self._poll)
+        if sys.platform == "win32":
+            self.root.after(150, self._enable_tkdnd)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------------------------------------------------------- UI
@@ -142,10 +157,12 @@ class WatermarkApp:
 
         bar = ttk.Frame(right)
         bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        ttk.Button(bar, text="适应窗口", command=self.render).pack(side="left")
+        ttk.Button(bar, text="适应窗口", command=self._fit_window).pack(side="left")
+        ttk.Button(bar, text="放大 +", command=self.zoom_in).pack(side="left", padx=(4, 0))
+        ttk.Button(bar, text="缩小 −", command=self.zoom_out).pack(side="left", padx=(2, 0))
         self.toggle_btn = ttk.Button(bar, text="查看处理效果", command=self.toggle_result)
-        self.toggle_btn.pack(side="left", padx=4)
-        ttk.Label(bar, text="去水印：拖拽矩形或涂抹水印区域；红色为要修复的范围").pack(side="left", padx=10)
+        self.toggle_btn.pack(side="left", padx=6)
+        ttk.Label(bar, text="左键画选区 · 移动工具/右键拖图 · 滚轮缩放").pack(side="left", padx=10)
 
         self.canvas = tk.Canvas(right, bg="#f4f4f4", highlightthickness=1, highlightbackground="#b8b8b8")
         self.canvas.grid(row=1, column=0, sticky="nsew")
@@ -153,15 +170,21 @@ class WatermarkApp:
         self.canvas.bind("<Button-1>", self.on_mouse_down)
         self.canvas.bind("<B1-Motion>", self.on_mouse_move)
         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
+        self.canvas.bind("<MouseWheel>", self.on_wheel)
+        self.canvas.bind("<ButtonPress-3>", self.on_pan_start)
+        self.canvas.bind("<B3-Motion>", self.on_pan_move)
+        self.canvas.bind("<ButtonRelease-3>", self.on_pan_end)
 
         bottom = ttk.Frame(self.root, padding=(10, 4))
         bottom.grid(row=2, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(bottom, mode="determinate")
         self.progress.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        ttk.Button(bottom, text="打开输出文件夹", command=self.open_output).grid(row=0, column=1, padx=2)
-        ttk.Button(bottom, text="取消", command=self.cancel).grid(row=0, column=2, padx=2)
-        ttk.Label(bottom, textvariable=self.status_var).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Button(bottom, text="输出目录", command=self.choose_output_base).grid(row=0, column=1, padx=2)
+        ttk.Button(bottom, text="默认目录", command=self.reset_output_base).grid(row=0, column=2, padx=2)
+        ttk.Button(bottom, text="打开输出", command=self.open_output).grid(row=0, column=3, padx=2)
+        ttk.Button(bottom, text="取消", command=self.cancel).grid(row=0, column=4, padx=2)
+        ttk.Label(bottom, textvariable=self.status_var).grid(row=1, column=0, columnspan=5, sticky="w", pady=(4, 0))
 
         logframe = ttk.LabelFrame(self.root, text="处理日志", padding=4)
         logframe.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
@@ -181,9 +204,14 @@ class WatermarkApp:
         ttk.Label(f, text="2. 选择画笔工具").pack(anchor="w")
         tool = ttk.Frame(f)
         tool.pack(fill="x", pady=4)
-        ttk.Radiobutton(tool, text="矩形", value="rect", variable=self.tool_var).pack(side="left", padx=(0, 10))
-        ttk.Radiobutton(tool, text="画笔", value="brush", variable=self.tool_var).pack(side="left", padx=(0, 10))
-        ttk.Radiobutton(tool, text="橡皮", value="eraser", variable=self.tool_var).pack(side="left")
+        ttk.Radiobutton(tool, text="矩形", value="rect", variable=self.tool_var,
+                        command=self._on_tool_change).pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(tool, text="画笔", value="brush", variable=self.tool_var,
+                        command=self._on_tool_change).pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(tool, text="橡皮", value="eraser", variable=self.tool_var,
+                        command=self._on_tool_change).pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(tool, text="移动", value="pan", variable=self.tool_var,
+                        command=self._on_tool_change).pack(side="left")
         row = ttk.Frame(f)
         row.pack(fill="x", pady=2)
         ttk.Label(row, text="画笔粗细").pack(side="left")
@@ -259,6 +287,138 @@ class WatermarkApp:
             self.folder_var.set(d)
             self.rescan()
 
+    def _enable_tkdnd(self) -> None:
+        """用 tkinterdnd2 接收拖放；比子类化窗口过程稳定。"""
+        if DND_FILES is None or not hasattr(self.root, "drop_target_register"):
+            self.log("当前环境不支持拖放，请用“选择文件夹”按钮。")
+            return
+        try:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<Drop>>", self._on_tkdnd_drop)
+        except Exception as exc:
+            self.log(f"拖放初始化失败：{exc}")
+
+    def _on_tkdnd_drop(self, event) -> None:
+        try:
+            paths = list(self.root.tk.splitlist(event.data))
+        except Exception:
+            paths = [str(event.data)]
+        self._on_drop(paths)
+
+    def _on_drop(self, paths: list[str]) -> None:
+        dirs = [p for p in paths if os.path.isdir(p)]
+        imgs = [p for p in paths if os.path.isfile(p)
+                and os.path.splitext(p)[1].lower() in core.IMAGE_EXTS]
+        if dirs:
+            target = dirs[0]
+        elif imgs:
+            target = os.path.dirname(imgs[0])
+        else:
+            self.log("拖入的内容不是文件夹或图片。")
+            return
+        self.folder = os.path.normpath(target)
+        self.folder_var.set(self.folder)
+        self.rescan()
+        if imgs and not dirs:
+            self.load_sample(imgs[0], quiet=True)
+        self.log(f"拖入文件夹：{self.folder}")
+
+    def _current_img(self):
+        if self.show_result and self.result_img is not None:
+            return self.result_img
+        return self.sample_img
+
+    def _on_tool_change(self) -> None:
+        self.canvas.config(cursor="fleur" if self.tool_var.get() == "pan" else "")
+
+    def _fit_window(self) -> None:
+        self.zoom = 1.0
+        self.pan_x = 0
+        self.pan_y = 0
+        if self.tool_var.get() == "pan":
+            self.tool_var.set("rect")
+            self._on_tool_change()
+        self.render()
+
+    def _zoom_by(self, factor: float, anchor: tuple[int, int] | None = None) -> None:
+        img = self._current_img()
+        if img is None:
+            return
+        cw = max(self.canvas.winfo_width(), 200)
+        ch = max(self.canvas.winfo_height(), 200)
+        ax, ay = anchor or (cw // 2, ch // 2)
+        old = self.disp_scale or 1.0
+        ix = (ax - self.disp_ox) / old
+        iy = (ay - self.disp_oy) / old
+        new_zoom = max(0.2, min(6.0, self.zoom * factor))
+        if abs(new_zoom - self.zoom) < 1e-6:
+            return
+        self.zoom = new_zoom
+        ns = min(cw / img.width, ch / img.height, 1.0) * self.zoom
+        dw, dh = img.width * ns, img.height * ns
+        self.pan_x = ax - ix * ns - (cw - dw) / 2
+        self.pan_y = ay - iy * ns - (ch - dh) / 2
+        self.render()
+
+    def zoom_in(self) -> None:
+        self._zoom_by(1.25)
+
+    def zoom_out(self) -> None:
+        self._zoom_by(0.8)
+
+    def on_wheel(self, event) -> str:
+        if self.sample_img is None:
+            return "break"
+        self._zoom_by(1.15 if event.delta > 0 else 1 / 1.15, (event.x, event.y))
+        return "break"
+
+    def on_pan_start(self, event) -> None:
+        if self.sample_img is None:
+            return
+        self.pan_anchor = (event.x, event.y)
+        self.pan_origin = (self.pan_x, self.pan_y)
+        self.pan_step = (0, 0)
+        self.canvas.config(cursor="fleur")
+
+    def on_pan_move(self, event) -> None:
+        if not self.pan_anchor:
+            return
+        # 关键：anchor 必须保持按下时的位置，dx/dy 是累计位移。
+        # 之前每次移动都重置 anchor，导致 pan 只保留最后一小步，松开后几乎回到原位。
+        dx = event.x - self.pan_anchor[0]
+        dy = event.y - self.pan_anchor[1]
+        step_x = dx - self.pan_step[0]
+        step_y = dy - self.pan_step[1]
+        self.pan_step = (dx, dy)
+        self.canvas.move("view", step_x, step_y)
+        self.disp_ox += step_x
+        self.disp_oy += step_y
+        self.pan_x = self.pan_origin[0] + dx
+        self.pan_y = self.pan_origin[1] + dy
+
+    def on_pan_end(self, event) -> None:
+        if not self.pan_anchor:
+            return
+        self.pan_anchor = None
+        self.canvas.config(cursor="fleur" if self.tool_var.get() == "pan" else "")
+        self.render()
+
+    def choose_output_base(self) -> None:
+        initial = self.out_base or self.folder or os.path.expanduser("~")
+        d = filedialog.askdirectory(title="选择输出根目录（下面会自动创建 去水印/加水印）",
+                                    initialdir=initial)
+        if d:
+            base = os.path.normpath(d)
+            if os.path.basename(base) in ("去水印", "加水印"):
+                base = os.path.dirname(base)
+                self.log("检测到选择的是输出子文件夹，已自动改用其上级目录。")
+            self.out_base = base
+            self.log(f"输出根目录：{self.out_base}（会在其下创建 去水印/加水印）")
+
+    def reset_output_base(self) -> None:
+        self.out_base = ""
+        self.log("输出根目录已恢复为图片文件夹。")
+
     def rescan(self) -> None:
         self.folder = self.folder_var.get().strip()
         self.files = []
@@ -282,6 +442,9 @@ class WatermarkApp:
         self.mask = None
         self.result_img = None
         self.show_result = False
+        self.zoom = 1.0
+        self.pan_x = 0
+        self.pan_y = 0
         self.sample_var.set("未加载样图")
         self.render()
         if self.files and self.sample_path is None:
@@ -304,6 +467,9 @@ class WatermarkApp:
         self.mask = np.zeros((img.height, img.width), np.uint8)
         self.result_img = None
         self.show_result = False
+        self.zoom = 1.0
+        self.pan_x = 0
+        self.pan_y = 0
         self.sample_var.set(f"{os.path.basename(path)}  ({img.width}×{img.height})")
         if not quiet:
             self.log(f"加载样图：{path}")
@@ -324,28 +490,56 @@ class WatermarkApp:
     # ---------------------------------------------------------------- canvas
     def render(self) -> None:
         self.canvas.delete("all")
-        img = self.result_img if (self.show_result and self.result_img is not None) else self.sample_img
+        img = self._current_img()
         if img is None:
             self.canvas.create_text(max(self.canvas.winfo_width() // 2, 200),
                                     max(self.canvas.winfo_height() // 2, 150),
                                     text="选择文件夹后会自动加载第一张图片作为样图",
-                                    fill="#777", font=("Microsoft YaHei UI", 12))
+                                    fill="#777", font=("Microsoft YaHei UI", 12), tags="view")
             return
         cw = max(self.canvas.winfo_width(), 200)
         ch = max(self.canvas.winfo_height(), 200)
-        scale = min(cw / img.width, ch / img.height, 1.0)
+        scale = min(cw / img.width, ch / img.height, 1.0) * self.zoom
         self.disp_scale = scale
-        dw, dh = max(1, int(img.width * scale)), max(1, int(img.height * scale))
-        disp = img.resize((dw, dh), Image.LANCZOS)
+        dw, dh = max(1, round(img.width * scale)), max(1, round(img.height * scale))
+        base_x, base_y = (cw - dw) // 2, (ch - dh) // 2
+        ox, oy = base_x + self.pan_x, base_y + self.pan_y
+        # 只要放大过（zoom>1）就允许平移；缩小到适应窗口时自动回中。
+        # 拖动时最多把图片移到只剩 80px 可见，避免完全找不回来。
+        allow_pan = self.zoom > 1.0001
+        if allow_pan:
+            ox = max(80 - dw, min(cw - 80, ox))
+            oy = max(80 - dh, min(ch - 80, oy))
+        else:
+            ox, oy = base_x, base_y
+        self.pan_x, self.pan_y = ox - base_x, oy - base_y
+        self.disp_ox, self.disp_oy = ox, oy
+
+        vx0, vy0 = max(0, ox), max(0, oy)
+        vx1, vy1 = min(cw, ox + dw), min(ch, oy + dh)
+        if vx1 <= vx0 or vy1 <= vy0:
+            self.canvas.create_text(cw // 2, ch // 2, text="图片已移出视图，点“适应窗口”恢复",
+                                    fill="#777", font=("Microsoft YaHei UI", 12), tags="view")
+            return
+
+        sx0 = max(0, int((vx0 - ox) / scale))
+        sy0 = max(0, int((vy0 - oy) / scale))
+        sx1 = min(img.width, int((vx1 - ox) / scale) + 2)
+        sy1 = min(img.height, int((vy1 - oy) / scale) + 2)
+        crop = img.crop((sx0, sy0, sx1, sy1))
+        cw2 = max(1, round((sx1 - sx0) * scale))
+        ch2 = max(1, round((sy1 - sy0) * scale))
+        disp = crop.resize((cw2, ch2), Image.BILINEAR)
+
         if not self.show_result and self.nb.index("current") == 0 and self.mask is not None:
-            m = Image.fromarray(self.mask).resize((dw, dh), Image.NEAREST)
-            red = Image.new("RGBA", (dw, dh), (255, 0, 0, 0))
+            m = Image.fromarray(self.mask).crop((sx0, sy0, sx1, sy1)).resize((cw2, ch2), Image.NEAREST)
+            red = Image.new("RGBA", (cw2, ch2), (255, 0, 0, 0))
             red.putalpha(m.point(lambda a: int(a * 0.42)))
             disp = Image.alpha_composite(disp.convert("RGBA"), red).convert("RGB")
-        self.disp_ox = (cw - dw) // 2
-        self.disp_oy = (ch - dh) // 2
+
         self.tk_img = ImageTk.PhotoImage(disp)
-        self.canvas.create_image(self.disp_ox, self.disp_oy, anchor="nw", image=self.tk_img)
+        self.canvas.create_image(ox + sx0 * scale, oy + sy0 * scale,
+                                 anchor="nw", image=self.tk_img, tags="view")
 
     def _to_image(self, x: int, y: int) -> tuple[int, int] | None:
         if self.sample_img is None or self.disp_scale <= 0:
@@ -356,6 +550,9 @@ class WatermarkApp:
 
     def on_mouse_down(self, e) -> None:
         if self.busy or self.sample_img is None or self.nb.index("current") != 0:
+            return
+        if self.tool_var.get() == "pan":
+            self.on_pan_start(e)
             return
         p = self._to_image(e.x, e.y)
         if not p:
@@ -370,6 +567,9 @@ class WatermarkApp:
 
     def on_mouse_move(self, e) -> None:
         if self.busy or self.sample_img is None or self.nb.index("current") != 0:
+            return
+        if self.tool_var.get() == "pan":
+            self.on_pan_move(e)
             return
         p = self._to_image(e.x, e.y)
         if not p:
@@ -388,6 +588,9 @@ class WatermarkApp:
             self.last_pt = p
 
     def on_mouse_up(self, e) -> None:
+        if self.tool_var.get() == "pan":
+            self.on_pan_end(e)
+            return
         if self.tool_var.get() == "rect" and self.drag_start and self.mask is not None:
             p = self._to_image(e.x, e.y)
             if p:
@@ -402,6 +605,8 @@ class WatermarkApp:
             self.canvas.delete("temp")
             self.show_result = False
             self.render()
+        elif self.tool_var.get() in ("brush", "eraser"):
+            self.render()
         self.last_pt = None
 
     def _paint(self, a: tuple[int, int], b: tuple[int, int]) -> None:
@@ -414,7 +619,18 @@ class WatermarkApp:
         else:
             cv2.line(self.mask, a, b, value, r * 2, cv2.LINE_AA)
         self.show_result = False
-        self.render()
+        # 画笔移动时只在画布上叠加红色笔迹，不重绘整张图；松开鼠标后再合成 mask。
+        if self.tool_var.get() == "brush":
+            x0 = self.disp_ox + a[0] * self.disp_scale
+            y0 = self.disp_oy + a[1] * self.disp_scale
+            x1 = self.disp_ox + b[0] * self.disp_scale
+            y1 = self.disp_oy + b[1] * self.disp_scale
+            w = max(1, int(r * 2 * self.disp_scale))
+            self.canvas.create_line(x0, y0, x1, y1, fill="#ff3333",
+                                    width=w, capstyle="round", tags="brush")
+            if a == b:
+                self.canvas.create_oval(x0 - w / 2, y0 - w / 2, x0 + w / 2, y0 + w / 2,
+                                        fill="#ff3333", outline="", tags="brush")
 
     def clear_mask(self) -> None:
         if self.mask is not None:
@@ -481,7 +697,49 @@ class WatermarkApp:
 
     # ---------------------------------------------------------------- batch
     def _out_dir(self, kind: str) -> str:
-        return os.path.join(self.folder, kind)
+        root = os.path.normpath(self.out_base or self.folder)
+        if os.path.basename(root) in ("去水印", "加水印"):
+            root = os.path.dirname(root)
+        return os.path.join(root, kind)
+
+    def _suggest_output(self) -> str:
+        candidates = []
+        if os.path.isdir("E:\\"):
+            candidates.append(r"E:\水印输出")
+        candidates.append(os.path.join(os.path.expanduser("~"), "Pictures", "水印输出"))
+        for c in candidates:
+            try:
+                os.makedirs(c, exist_ok=True)
+                probe = os.path.join(c, f".write_test_{os.getpid()}")
+                with open(probe, "wb") as f:
+                    f.write(b"ok")
+                os.remove(probe)
+                return c
+            except OSError:
+                continue
+        return ""
+
+    def _prepare_out(self, kind: str, allow_fallback: bool = True) -> str | None:
+        out = self._out_dir(kind)
+        try:
+            os.makedirs(out, exist_ok=True)
+            probe = os.path.join(out, f".write_test_{os.getpid()}")
+            with open(probe, "wb") as f:
+                f.write(b"ok")
+            os.remove(probe)
+            return out
+        except OSError as exc:
+            msg = (f"无法写入输出目录：\n{out}\n\n{exc}\n\n"
+                   "Windows 不允许往这个位置写文件，通常是桌面被“受控文件夹访问”保护。\n"
+                   "可以点下方“输出目录”手动换位置，或让软件改用建议目录。")
+            suggest = self._suggest_output() if allow_fallback else ""
+            if suggest and messagebox.askyesno(
+                    APP_NAME, msg + f"\n\n是否改用：\n{suggest}\n并重试？"):
+                self.out_base = suggest
+                return self._prepare_out(kind, allow_fallback=False)
+            if not suggest:
+                messagebox.showerror(APP_NAME, msg)
+            return None
 
     def start_remove(self) -> None:
         if self.busy:
@@ -491,6 +749,9 @@ class WatermarkApp:
         if not self.files:
             messagebox.showinfo(APP_NAME, "当前文件夹里没有图片。")
             return
+        out = self._prepare_out("去水印")
+        if not out:
+            return
         self.cancel_event.clear()
         self.busy = True
         self._set_busy(True)
@@ -498,7 +759,7 @@ class WatermarkApp:
         self.status_var.set("开始批量去水印…")
         kwargs = dict(files=list(self.files), mask=self.mask.copy(), sample_bgr=self.sample_bgr.copy(),
                       method=self._method(), grow=int(self.grow_var.get()),
-                      template=bool(self.template_var.get()), out=self._out_dir("去水印"),
+                      template=bool(self.template_var.get()), out=out,
                       base=self.folder)
         self.worker = threading.Thread(target=self._remove_worker, kwargs=kwargs, daemon=True)
         self.worker.start()
@@ -512,12 +773,15 @@ class WatermarkApp:
         if not self.logo_var.get().strip() and not self.text_var.get().strip():
             messagebox.showinfo(APP_NAME, "请填写水印文字，或选择 Logo。")
             return
+        out = self._prepare_out("加水印")
+        if not out:
+            return
         self.cancel_event.clear()
         self.busy = True
         self._set_busy(True)
         self.progress.configure(maximum=len(self.files), value=0)
         self.status_var.set("开始批量加水印…")
-        kwargs = dict(files=list(self.files), out=self._out_dir("加水印"), base=self.folder,
+        kwargs = dict(files=list(self.files), out=out, base=self.folder,
                       text=self.text_var.get().strip(), color=self.color_var.get(),
                       font_size=int(self.font_var.get()), opacity=float(self.opacity_var.get()),
                       margin=int(self.margin_var.get()), logo=self.logo_var.get().strip(),
@@ -653,7 +917,7 @@ class WatermarkApp:
             os.startfile(self.last_out)
             return
         kind = "去水印" if self.nb.index("current") == 0 else "加水印"
-        p = os.path.join(self.folder, kind) if self.folder else ""
+        p = self._out_dir(kind) if (self.folder or self.out_base) else ""
         if p and os.path.isdir(p):
             os.startfile(p)
         else:
@@ -676,13 +940,14 @@ class WatermarkApp:
 
 def main() -> None:
     enable_dpi()
-    root = tk.Tk()
+    root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
     WatermarkApp(root)
     root.mainloop()
 
 
 if __name__ == "__main__":
     main()
+
 
 
 
